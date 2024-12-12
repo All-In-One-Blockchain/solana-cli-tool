@@ -15,15 +15,12 @@ pub struct SolanaConfig {
 }
 
 impl SolanaConfig {
-    pub fn get_api_key(&self) -> String {
-        // split string by "api-key=" and take the second part
-        // split self.json_rpc_url by "api-key=" and take the second part
+    pub fn get_api_key(&self) -> Result<String> {
         self.json_rpc_url
             .split("api-key=")
-            .collect::<Vec<&str>>()
-            .get(1)
-            .unwrap()
-            .to_string()
+            .nth(1)
+            .ok_or_else(|| anyhow::anyhow!("No API key found in RPC URL"))
+            .map(String::from)
     }
 }
 
