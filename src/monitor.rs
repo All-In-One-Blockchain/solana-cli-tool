@@ -1,13 +1,19 @@
 use crate::config::{get_rpc_client, read_solana_config};
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
+use clap::Parser;
 use console::{style, Emoji};
-use futures::future::join_all;
+use futures_util::SinkExt;
 use futures_util::StreamExt;
+use serde::Deserialize;
+use serde::Serialize;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status_client_types::UiTransactionEncoding;
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
-use tokio::{sync::{broadcast, Mutex}, time::{Instant, sleep}};
+use tokio::{
+    sync::{broadcast, Mutex},
+    time::{sleep, Instant},
+};
 use tokio_tungstenite::connect_async;
 use url::Url;
 
@@ -344,7 +350,7 @@ impl Monitor {
         let ws_url = Url::parse(&config.websocket_url)?;
 
         let (ws_stream, _) = connect_async(ws_url).await?;
-        let (write, read) = ws_stream.split();
+        let (mut write, mut read) = ws_stream.split();
 
         let subscribe_msg = serde_json::json!({
             "jsonrpc": "2.0",
@@ -356,7 +362,11 @@ impl Monitor {
             ]
         });
 
-        write.send(serde_json::to_string(&subscribe_msg)?).await?;
+        write
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&subscribe_msg)?,
+            ))
+            .await?;
 
         let mut last_balance = None;
 
@@ -375,7 +385,7 @@ impl Monitor {
                         let new_balance = lamports as f64 / 1e9;
 
                         if let Some(old_balance) = last_balance {
-                            if (new_balance - old_balance).abs() > 0.000001 {
+                            if (new_balance - old_balance as f64).abs() > 0.000001 {
                                 let event = MonitorEvent::BalanceChange {
                                     address: address.to_string(),
                                     old_balance,
@@ -401,6 +411,7 @@ impl Monitor {
 
         Ok(())
     }
+}
 
 pub async fn run_monitor(args: &MonitorArgs) -> Result<()> {
     let (monitor, mut rx) = Monitor::new();
