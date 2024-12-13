@@ -49,7 +49,7 @@ pub async fn handle_account_create_timestamp(
 async fn check_default_timestamp(client: &RpcClient) -> anyhow::Result<()> {
     let keypair = default_account()?;
 
-    let datetime = get_account_creation_date(&client, &keypair.pubkey()).await?;
+    let datetime = get_account_creation_date(client, &keypair.pubkey()).await?;
     let timestamp_str = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
 
     println!(
