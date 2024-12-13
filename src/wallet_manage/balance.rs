@@ -13,7 +13,7 @@ pub struct BalanceArgs {
 
 async fn check_balance(address: &str) -> anyhow::Result<()> {
     let client = get_rpc_client()?;
-    let pubkey = Pubkey::from_str(&address)?;
+    let pubkey = Pubkey::from_str(address)?;
     let balance = client.get_balance(&pubkey).await?;
     let lamports = Sol(balance);
 
@@ -29,7 +29,7 @@ async fn check_balance(address: &str) -> anyhow::Result<()> {
 
 pub async fn display_balance(args: &BalanceArgs) -> anyhow::Result<()> {
     if let Some(address) = args.address.as_ref() {
-        check_balance(&address).await
+        check_balance(address).await
     } else {
         check_default_balance().await
     }

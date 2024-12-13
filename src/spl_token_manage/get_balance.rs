@@ -62,7 +62,7 @@ pub async fn handle_get_balance(args: &GetBalanceArgs) -> anyhow::Result<()> {
 async fn check_default_balance(client: &RpcClient, mint_id: &Pubkey) -> anyhow::Result<()> {
     let keypair = default_account()?;
     let target: Pubkey = keypair.pubkey();
-    let addr = spl_associated_token_account::get_associated_token_address(&target, &mint_id);
+    let addr = spl_associated_token_account::get_associated_token_address(&target, mint_id);
     let balance = client.get_token_account_balance(&addr).await?;
 
     println!(

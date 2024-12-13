@@ -43,7 +43,7 @@ pub fn create_new_wallet(args: &NewWalletArgs) -> Result<()> {
     // Create directories if they don't exist
     std::fs::create_dir_all(keypair_path.parent().unwrap())?;
 
-    write_keypair_file(&keypair, &keypair_path.to_str().unwrap())?;
+    write_keypair_file(&keypair, keypair_path.to_str().unwrap())?;
     // 可以添加成功标记
     println!(
         "{} {}",
