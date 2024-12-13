@@ -1,17 +1,15 @@
-use crate::config::get_rpc_client;
+use crate::config::{get_rpc_client, read_solana_config};
 use anyhow::Result;
-use chrono::DateTime;
-use chrono::Local;
-use chrono::Utc;
-use clap::Parser;
+use chrono::{DateTime, Local, Utc};
 use console::{style, Emoji};
-use serde::{Deserialize, Serialize};
+use futures::future::join_all;
+use futures_util::StreamExt;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status_client_types::UiTransactionEncoding;
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
-use tokio::sync::Mutex;
-use tokio::time::Instant;
-use tokio::{sync::broadcast, time::sleep};
+use tokio::{sync::{broadcast, Mutex}, time::{Instant, sleep}};
+use tokio_tungstenite::connect_async;
+use url::Url;
 
 #[derive(Parser, Debug)]
 pub struct MonitorArgs {
@@ -340,7 +338,69 @@ impl Monitor {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
-}
+
+    async fn monitor_address_websocket(&self, address: &str) -> Result<()> {
+        let config = read_solana_config()?;
+        let ws_url = Url::parse(&config.websocket_url)?;
+
+        let (ws_stream, _) = connect_async(ws_url).await?;
+        let (write, read) = ws_stream.split();
+
+        let subscribe_msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "accountSubscribe",
+            "params": [
+                address,
+                {"encoding": "jsonParsed", "commitment": "confirmed"}
+            ]
+        });
+
+        write.send(serde_json::to_string(&subscribe_msg)?).await?;
+
+        let mut last_balance = None;
+
+        while let Some(msg) = read.next().await {
+            let msg = msg?;
+            let value: serde_json::Value = serde_json::from_str(&msg.to_string())?;
+
+            if let Some(result) = value.get("result") {
+                println!("Subscribed to account updates. Subscription ID: {}", result);
+                continue;
+            }
+
+            if let Some(params) = value.get("params") {
+                if let Some(value) = params.get("value") {
+                    if let Some(lamports) = value.get("lamports").and_then(|l| l.as_u64()) {
+                        let new_balance = lamports as f64 / 1e9;
+
+                        if let Some(old_balance) = last_balance {
+                            if (new_balance - old_balance).abs() > 0.000001 {
+                                let event = MonitorEvent::BalanceChange {
+                                    address: address.to_string(),
+                                    old_balance,
+                                    new_balance,
+                                    timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                                };
+
+                                if let Err(e) = self.event_sender.send(event) {
+                                    println!(
+                                        "{} {}",
+                                        style("ERROR:").red().bold(),
+                                        style(format!("Failed to send event: {:?}", e)).red()
+                                    );
+                                }
+                            }
+                        }
+
+                        last_balance = Some(new_balance);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 
 pub async fn run_monitor(args: &MonitorArgs) -> Result<()> {
     let (monitor, mut rx) = Monitor::new();
@@ -400,6 +460,35 @@ pub async fn run_monitor(args: &MonitorArgs) -> Result<()> {
     // 监控地址列表
     for address in &args.addresses {
         let address = address.clone();
+
+        // Add WebSocket monitoring task
+        {
+            let monitor = monitor.clone();
+            let address = address.clone();
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    if let Err(e) = monitor.monitor_address_websocket(&address).await {
+                        println!(
+                            "{} {}",
+                            style("ERROR:").red().bold(),
+                            style(format!("WebSocket monitor error: {:?}", e)).red()
+                        );
+                        // Fallback to polling on WebSocket failure
+                        println!("Falling back to polling mechanism...");
+                        if let Err(e) = monitor.monitor_balance(&address).await {
+                            println!(
+                                "{} {}",
+                                style("ERROR:").red().bold(),
+                                style(format!("Fallback monitor error: {:?}", e)).red()
+                            );
+                        }
+                    }
+                    sleep(Duration::from_secs(5)).await;
+                }
+            });
+            handles.push(handle);
+        }
 
         // 创建SOL余额监控任务
         {
