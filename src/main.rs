@@ -37,6 +37,7 @@ impl Commands {
 async fn main() {
     let cmd = Commands::parse();
     if let Err(e) = cmd.run().await {
-        eprintln!("Error: {:?}", e);
+        eprintln!("Error executing command: {:?}", e);
+        std::process::exit(1);
     }
 }
