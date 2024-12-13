@@ -1,17 +1,20 @@
-use crate::config::get_rpc_client;
+use crate::config::{get_rpc_client, get_helius_client, get_websocket_config};
 use anyhow::Result;
-use chrono::DateTime;
-use chrono::Local;
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use clap::Parser;
 use console::{style, Emoji};
+use selene_helius_sdk::{
+    client::HeliusClient,
+    websocket::{WebsocketClient, WebsocketMessage, WebsocketConfig},
+    types::AccountInfo,
+};
 use serde::{Deserialize, Serialize};
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use solana_transaction_status_client_types::UiTransactionEncoding;
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
-use tokio::sync::Mutex;
-use tokio::time::Instant;
-use tokio::{sync::broadcast, time::sleep};
+use tokio::sync::{broadcast, Mutex};
+use tokio::time::{sleep, Instant};
+use url::Url;
 
 #[derive(Parser, Debug)]
 pub struct MonitorArgs {
@@ -51,104 +54,92 @@ pub struct Monitor {
     token_balance_cache: Arc<Mutex<HashMap<(String, String), f64>>>,
     tx_signature_cache: Arc<Mutex<HashMap<String, Vec<Signature>>>>,
     event_sender: broadcast::Sender<MonitorEvent>,
+    helius_client: HeliusClient,
+    websocket_config: WebsocketConfig,
 }
 
 impl Monitor {
-    pub fn new() -> (Self, broadcast::Receiver<MonitorEvent>) {
+    pub fn new() -> Result<(Self, broadcast::Receiver<MonitorEvent>)> {
         let (tx, rx) = broadcast::channel(100);
+        let helius_client = get_helius_client()?;
+        let websocket_config = get_websocket_config()?;
 
-        (
+        Ok((
             Self {
                 balance_cache: Arc::new(Mutex::new(HashMap::new())),
                 token_balance_cache: Arc::new(Mutex::new(HashMap::new())),
                 tx_signature_cache: Arc::new(Mutex::new(HashMap::new())),
                 event_sender: tx,
+                helius_client,
+                websocket_config,
             },
             rx,
-        )
+        ))
     }
 
-    // 监控 SOL 余额变化
-    async fn monitor_balance(&self, address: &str) -> Result<()> {
-        let pubkey = Pubkey::from_str(address)?;
-        let rpc_client = get_rpc_client()?;
-        let new_balance = rpc_client.get_balance(&pubkey).await? as f64 / 1e9;
+    async fn start_websocket_monitor(&self, addresses: Vec<String>) -> Result<()> {
+        let mut ws_client = WebsocketClient::connect(&self.websocket_config).await?;
 
-        let mut cache = self.balance_cache.lock().await;
-        let old_balance = *cache.get(address).unwrap_or(&0.0);
-
-        if (new_balance - old_balance).abs() > 0.000001 {
-            // 考虑浮点数精度
-            let event = MonitorEvent::BalanceChange {
-                address: address.to_string(),
-                old_balance,
-                new_balance,
-                timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            };
-
-            self.event_sender.send(event)?;
-            cache.insert(address.to_string(), new_balance);
+        // Subscribe to account updates for all addresses
+        for address in &addresses {
+            let pubkey = Pubkey::from_str(address)?;
+            ws_client.subscribe_account(&pubkey).await?;
         }
 
-        Ok(())
-    }
+        while let Ok(msg) = ws_client.receive_message().await {
+            match msg {
+                WebsocketMessage::AccountUpdate(account_info) => {
+                    let address = account_info.pubkey.to_string();
+                    let new_balance = account_info.lamports as f64 / 1e9;
 
-    async fn monitor_transactions(&self, address: &str) -> Result<()> {
-        let pubkey = Pubkey::from_str(address)?;
-        let rpc_client = get_rpc_client()?;
+                    let mut cache = self.balance_cache.lock().await;
+                    let old_balance = *cache.get(&address).unwrap_or(&0.0);
 
-        // 获取最新的签名
-        let signatures = rpc_client.get_signatures_for_address(&pubkey).await?;
+                    if (new_balance - old_balance).abs() > 0.000001 {
+                        let event = MonitorEvent::BalanceChange {
+                            address: address.clone(),
+                            old_balance,
+                            new_balance,
+                            timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                        };
 
-        for sig_info in signatures.iter().take(10) {
-            let signature = Signature::from_str(&sig_info.signature)?;
-
-            let mut cache = self.tx_signature_cache.lock().await;
-            let known_signatures = cache.entry(address.to_string()).or_insert_with(Vec::new);
-
-            // 检查是否是新交易
-            if !known_signatures.contains(&signature) {
-                // 获取交易详情
-                if let Ok(tx) = rpc_client
-                    .get_transaction(&signature, UiTransactionEncoding::Json)
-                    .await
-                {
-                    let status = if sig_info.err.is_some() {
-                        "Failed".to_string()
-                    } else {
-                        "Success".to_string()
-                    };
-
-                    let timestamp = if let Some(block_time) = tx.block_time {
-                        DateTime::<Utc>::from_timestamp(block_time, 0)
-                            .unwrap_or_else(|| Utc::now())
-                            .with_timezone(&Local)
-                            .format("%Y-%m-%d %H:%M:%S")
-                            .to_string()
-                    } else {
-                        Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-                    };
-
-                    let event = MonitorEvent::NewTransaction {
-                        address: address.to_string(),
-                        signature: signature.to_string(),
-                        timestamp,
-                        status,
-                    };
-
-                    self.event_sender.send(event)?;
-                    known_signatures.push(signature);
-
-                    // 只保留最近的50个签名
-                    if known_signatures.len() > 50 {
-                        known_signatures.drain(0..known_signatures.len() - 50);
+                        if let Err(e) = self.event_sender.send(event) {
+                            println!("Failed to send balance change event: {:?}", e);
+                        }
+                        cache.insert(address, new_balance);
                     }
                 }
+                WebsocketMessage::Transaction(transaction) => {
+                    for address in &addresses {
+                        if transaction.involved_accounts.contains(&Pubkey::from_str(address)?) {
+                            let signature = transaction.signature.to_string();
+                            let mut cache = self.tx_signature_cache.lock().await;
+                            let known_signatures = cache.entry(address.clone()).or_insert_with(Vec::new);
+
+                            if !known_signatures.contains(&transaction.signature) {
+                                let status = if transaction.successful { "Success" } else { "Failed" };
+                                let event = MonitorEvent::NewTransaction {
+                                    address: address.clone(),
+                                    signature,
+                                    timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                                    status: status.to_string(),
+                                };
+
+                                if let Err(e) = self.event_sender.send(event) {
+                                    println!("Failed to send transaction event: {:?}", e);
+                                }
+                                known_signatures.push(transaction.signature);
+
+                                if known_signatures.len() > 50 {
+                                    known_signatures.drain(0..known_signatures.len() - 50);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
-
-        // 添加延迟以避免过于频繁的请求
-        tokio::time::sleep(Duration::from_secs(1)).await;
         Ok(())
     }
 
@@ -343,9 +334,9 @@ impl Monitor {
 }
 
 pub async fn run_monitor(args: &MonitorArgs) -> Result<()> {
-    let (monitor, mut rx) = Monitor::new();
+    let (monitor, mut rx) = Monitor::new()?;
 
-    // 启动事件处理器
+    // Start event handler
     tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
             match event {
@@ -394,50 +385,24 @@ pub async fn run_monitor(args: &MonitorArgs) -> Result<()> {
         }
     });
 
-    // 创建所有监控任务
     let mut handles = vec![];
 
-    // 监控地址列表
+    // Start websocket monitor for all addresses
+    {
+        let monitor = monitor.clone();
+        let addresses = args.addresses.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = monitor.start_websocket_monitor(addresses).await {
+                println!("Websocket monitor error: {:?}", e);
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Start token monitoring tasks (keeping existing implementation)
     for address in &args.addresses {
-        let address = address.clone();
-
-        // 创建SOL余额监控任务
-        {
-            let monitor = monitor.clone();
-            let address = address.clone();
-            let interval = args.interval;
-
-            let handle = tokio::spawn(async move {
-                loop {
-                    if let Err(e) = monitor.monitor_balance(&address).await {
-                        println!("Balance monitor error: {:?}", e);
-                    }
-                    sleep(Duration::from_secs(interval)).await;
-                }
-            });
-            handles.push(handle);
-        }
-
-        // 创建交易监控任务
-        {
-            let monitor = monitor.clone();
-            let address = address.clone();
-            let interval = args.interval;
-
-            let handle = tokio::spawn(async move {
-                loop {
-                    if let Err(e) = monitor.monitor_transactions(&address).await {
-                        println!("Transaction monitor error: {:?}", e);
-                    }
-                    sleep(Duration::from_secs(interval)).await;
-                }
-            });
-            handles.push(handle);
-        }
-
-        // 代币监控任务
         let token_addresses = vec![
-            "GJAFwWjJ3vnTsrQVabjBVK2TYB1YtRCQXRDfDgUnpump", // 示例代币地址
+            "GJAFwWjJ3vnTsrQVabjBVK2TYB1YtRCQXRDfDgUnpump", // Example token address
         ];
 
         for token_address in token_addresses {
@@ -448,10 +413,7 @@ pub async fn run_monitor(args: &MonitorArgs) -> Result<()> {
 
             let handle = tokio::spawn(async move {
                 loop {
-                    if let Err(e) = monitor
-                        .monitor_token_balance(&address, &token_address)
-                        .await
-                    {
+                    if let Err(e) = monitor.monitor_token_balance(&address, &token_address).await {
                         println!("Token monitor error for {}: {:?}", token_address, e);
                     }
                     sleep(Duration::from_secs(interval)).await;
@@ -461,8 +423,6 @@ pub async fn run_monitor(args: &MonitorArgs) -> Result<()> {
         }
     }
 
-    // 等待所有任务完成（实际上它们会永远运行）
     futures::future::join_all(handles).await;
-
     Ok(())
 }

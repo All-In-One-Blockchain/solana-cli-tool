@@ -4,6 +4,11 @@ use console::style;
 use serde::{Deserialize, Serialize};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use std::path::PathBuf;
+use url::Url;
+use selene_helius_sdk::{
+    client::HeliusClient,
+    websocket::WebsocketConfig,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SolanaConfig {
@@ -16,8 +21,6 @@ pub struct SolanaConfig {
 
 impl SolanaConfig {
     pub fn get_api_key(&self) -> String {
-        // split string by "api-key=" and take the second part
-        // split self.json_rpc_url by "api-key=" and take the second part
         self.json_rpc_url
             .split("api-key=")
             .collect::<Vec<&str>>()
@@ -49,6 +52,17 @@ pub fn read_solana_config() -> Result<SolanaConfig> {
 pub fn get_rpc_client() -> Result<RpcClient> {
     let config = read_solana_config()?;
     Ok(RpcClient::new(config.json_rpc_url))
+}
+
+pub fn get_helius_client() -> Result<HeliusClient> {
+    let config = read_solana_config()?;
+    let api_key = config.get_api_key();
+    Ok(HeliusClient::new(&api_key))
+}
+
+pub fn get_websocket_config() -> Result<WebsocketConfig> {
+    let config = read_solana_config()?;
+    Ok(WebsocketConfig::new(&config.get_api_key()))
 }
 
 pub fn show_config() -> anyhow::Result<()> {
