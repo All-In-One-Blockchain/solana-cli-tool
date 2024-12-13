@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SolanaConfig {
     json_rpc_url: String,
-    websocket_url: String,
+    pub websocket_url: String,
     keypair_path: String,
     address_labels: std::collections::HashMap<String, String>,
     commitment: String,
