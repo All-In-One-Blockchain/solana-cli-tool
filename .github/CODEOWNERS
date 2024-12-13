@@ -1,0 +1,16 @@
+# Default owners for everything in the repository
+*       @DaviRain-Su
+
+# Specific ownership for core components
+/src/wallet_manage/     @DaviRain-Su
+/src/spl_token_manage/  @DaviRain-Su
+/src/monitor.rs         @DaviRain-Su
+
+# Configuration files
+/src/config.rs         @DaviRain-Su
+/src/utils.rs          @DaviRain-Su
+
+# GitHub specific files
+/.github/              @DaviRain-Su
+/CONTRIBUTING.md       @DaviRain-Su
+/README.md            @DaviRain-Su
